@@ -1,63 +1,76 @@
-extern crate csv;
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::ops::Range;
 use std::string::String;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Deserializer;
+
+use crate::{KvsError, Result};
+use std::ffi::OsStr;
+
+const COMPATION_THRESHOLD: u64 = 1024*1024;
 
 pub struct KvStore {
     map: HashMap<String, String>,
-    file: String,
+    path: PathBuf,
+    readers: HashMap<u64, BufReaderWithPos<File>>,
+    writer: BufWriterWithPos<File>,
+    current_gen: u64,
+    index: BTreeMap<String, CommandPos>,
+    uncompacted: u64
 }
 
 impl KvStore {
-    pub fn new(file: Option<&str>) -> KvStore {
-        match file {
-            Some(file) => KvStore::read(file.to_string()),
-            _ => KvStore {
-                map: HashMap::new(),
-                file: String::from("default"),
-            },
+
+    pub fn open(path: impl Into<PathBuf>) -> Result<KvStore>{
+        let path = path.into();
+        fs::create_dir_all(&path)?;
+
+        let mut readers = HashMap::new();
+        let mut index = BTreeMap::new();
+        let gen_list = sorted_gen_list(&path)?;
+        let mut uncompacted = 0;
+
+        for &gen in &gen_list {
+            let mut reader = BufReaderWithPos::new(File::open(log_path(&path, gen))?)?;
+            uncompacted += load(gen, &mut reader, &mut index)?;
+            readers.insert(gen, reader);
         }
+
+        let current_gen = gen_list.last().unwrap_or(&0) + 1;
+        let writer = new_log_file(&path, current_gen, &mut readers)?;
+
+        Ok(KvStore {
+            path,
+            readers,
+            writer,
+            current_gen,
+            index,
+            uncompacted,
+        })
     }
 
-    pub fn read(file: String) -> KvStore {
-        let mut kvstore = KvStore {
-            map: HashMap::new(),
-            file: (&file).clone(),
-        };
-        if Path::new(&file).exists() {
-            let mut f = File::open(&file).unwrap();
-            let mut rdr = csv::ReaderBuilder::new().has_headers(false).from_reader(f);
-            for result in rdr.records() {
-                let record = result.unwrap();
-                kvstore.set(record[0].to_string(), record[1].to_string());
+    pub fn set(&mut self, key: String, value: String) -> Result<()> {
+        let cmd = Command::set(key, value);
+        let pos = self.writer.pos;
+        serde_json::to_writer(&mut self.writer, &cmd)?;
+        self.writer.flush()?;
+
+        if let Command::Set {key, .. } = cmd {
+            if let Some(old_cmd) = self.index.insert(key, (self.current_gen, pos..self.writer.pos).into())
+            {
+                self.uncompacted +=  old_cmd.len;
             }
         }
-        kvstore
-    }
 
-    pub fn sync(&self) {
-        let path = Path::new(&self.file);
-
-        let mut wtr = csv::Writer::from_path(path).unwrap();
-        for (k, v) in &self.map {
-            wtr.write_record(&[k, v]);
+        if self.uncompacted > COMPACTION_THRESHOLD  {
+            self.compact()?;
         }
-    }
 
-    pub fn get(&self, v: String) -> Option<String> {
-        self.map.get(&v).cloned()
+        Ok(())
     }
-
-    pub fn set(&mut self, k: String, v: String) {
-        self.map.insert(k, v);
-        self.sync();
-    }
-
-    pub fn remove(&mut self, k: String) -> Option<String> {
-        let v = self.map.remove(&k);
-        self.sync();
-        v
-    }
+        
 }
